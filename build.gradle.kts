@@ -3,8 +3,9 @@ plugins {
   `maven-publish`
 }
 
+java.sourceCompatibility = JavaVersion.VERSION_21
 java {
-    toolchain { languageVersion.set(JavaLanguageVersion.of(22)) }
+    toolchain { languageVersion.set(JavaLanguageVersion.of(21)) }
 }
 
 repositories {
