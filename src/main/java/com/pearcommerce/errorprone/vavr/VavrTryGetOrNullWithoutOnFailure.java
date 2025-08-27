@@ -12,6 +12,11 @@ import com.google.errorprone.matchers.Matcher;
 import com.google.errorprone.util.ASTHelpers;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.MethodInvocationTree;
+import com.sun.source.tree.ParenthesizedTree;
+import com.sun.source.tree.TypeCastTree;
+
+import javax.lang.model.element.Element;
+import java.util.Set;
 
 @AutoService(BugChecker.class)
 @BugPattern(
@@ -22,28 +27,63 @@ import com.sun.source.tree.MethodInvocationTree;
 public final class VavrTryGetOrNullWithoutOnFailure extends BugChecker
     implements BugChecker.MethodInvocationTreeMatcher {
 
-  private static final String TRY_CLASS = "io.vavr.control.Try";
+    private static final String TRY_CLASS = "io.vavr.control.Try";
 
-  private static final Matcher<ExpressionTree> GET_OR_NULL =
-      instanceMethod().onExactClass(TRY_CLASS).named("getOrNull");
+    // What we consider “handled/safe” earlier in the chain
+    private static final Set<String> HANDLERS_OR_SAFE = Set.of(
+        "onFailure", "orElseRun", "recover", "recoverWith", "fold",
+        "get", "getOrElseThrow", "failed" // safe terminals
+    );
 
-  @Override
-  public Description matchMethodInvocation(MethodInvocationTree tree, VisitorState state) {
-    if (!GET_OR_NULL.matches(tree, state)) return Description.NO_MATCH;
+    private static final Matcher<ExpressionTree> GET_OR_NULL =
+        instanceMethod().onDescendantOf(TRY_CLASS).named("getOrNull");
 
-    // If an earlier link in the fluent chain is onFailure(...), allow it.
-    ExpressionTree recv = ASTHelpers.getReceiver(tree);
-    while (recv instanceof MethodInvocationTree) {
-      MethodInvocationTree m = (MethodInvocationTree) recv;
-      if ("onFailure".contentEquals(m.getMethodSelect().toString().replaceAll("^.*\\.", ""))) {
-        return Description.NO_MATCH;
-      }
-      recv = ASTHelpers.getReceiver(m);
+    @Override
+    public Description matchMethodInvocation(MethodInvocationTree tree, VisitorState state) {
+        if (!GET_OR_NULL.matches(tree, state)) return Description.NO_MATCH;
+
+        // If the fluent chain already handled failure, don't flag.
+        if (chainAlreadyHandlesFailure(ASTHelpers.getReceiver(tree), state)) {
+            return Description.NO_MATCH;
+        }
+
+        return buildDescription(tree)
+            .setMessage("Calling Try.getOrNull() without onFailure(...) hides exceptions. " +
+                        "Prefer get() / getOrElseThrow(...) or handle via onFailure/orElseRun/recover/fold.")
+            .build();
     }
 
-    return buildDescription(tree)
-        .setMessage("Calling Try.getOrNull() without onFailure(...) hides exceptions. " +
-            "Prefer get() / getOrElseThrow(...) or handle via onFailure(...).")
-        .build();
-  }
+    /** Walk left through the fluent chain looking for handlers/safe terminals. */
+    private static boolean chainAlreadyHandlesFailure(ExpressionTree recv, VisitorState state) {
+        ExpressionTree cur = unwrap(recv);
+        while (cur instanceof MethodInvocationTree) {
+            MethodInvocationTree m = (MethodInvocationTree) cur;
+            Element sym = ASTHelpers.getSymbol(m);
+            if (sym != null) {
+                String name = sym.getSimpleName().toString();
+                if (HANDLERS_OR_SAFE.contains(name)) return true;
+                // Special-case: toEither() without args preserves Throwable → treat as safe
+                if (name.equals("toEither") && m.getArguments().isEmpty()) return true;
+            }
+            cur = unwrap(ASTHelpers.getReceiver(m));
+        }
+        return false;
+    }
+
+    /** Strip parens/casts so we don't miss handlers due to syntax noise. */
+    private static ExpressionTree unwrap(ExpressionTree e) {
+        ExpressionTree cur = e;
+        boolean changed;
+        do {
+            changed = false;
+            if (cur instanceof ParenthesizedTree) {
+                cur = ((ParenthesizedTree) cur).getExpression();
+                changed = true;
+            } else if (cur instanceof TypeCastTree) {
+                cur = ((TypeCastTree) cur).getExpression();
+                changed = true;
+            }
+        } while (changed);
+        return cur;
+    }
 }
