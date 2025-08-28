@@ -23,6 +23,7 @@ import java.util.Set;
     name = "VavrTryGetOrNullWithoutOnFailure",
     summary = "Try.getOrNull() hides exceptions; call onFailure(...) or use get()/getOrElseThrow(...).",
     severity = SeverityLevel.ERROR,
+    linkType = BugPattern.LinkType.CUSTOM,
     link = "https://chatgpt.com/share/68b06dc9-13ac-8007-8209-9abcd20f523e"
 )
 public final class VavrTryGetOrNullWithoutOnFailure extends BugChecker
