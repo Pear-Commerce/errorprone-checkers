@@ -21,7 +21,8 @@ import static com.google.errorprone.matchers.Matchers.staticMethod;
     explanation =
         "The 1-arg overloads of CompletableFuture.runAsync and supplyAsync use the global common ForkJoin pool, "
         + "which competes with other workloads globally. This can cause inconsistent behavior or even deadlock.",
-    severity = SeverityLevel.ERROR
+    severity = SeverityLevel.ERROR,
+    link = "https://chatgpt.com/share/68b06ca3-8818-8007-a6a5-40e0c777e654"
 )
 public class CompletableFutureMissingExecutor extends BugChecker
     implements BugChecker.MethodInvocationTreeMatcher {

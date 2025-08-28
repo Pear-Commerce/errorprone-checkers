@@ -22,7 +22,8 @@ import java.util.Set;
 @BugPattern(
     name = "VavrTryGetOrNullWithoutOnFailure",
     summary = "Try.getOrNull() hides exceptions; call onFailure(...) or use get()/getOrElseThrow(...).",
-    severity = SeverityLevel.WARNING
+    severity = SeverityLevel.ERROR,
+    link = "https://chatgpt.com/share/68b06dc9-13ac-8007-8209-9abcd20f523e"
 )
 public final class VavrTryGetOrNullWithoutOnFailure extends BugChecker
     implements BugChecker.MethodInvocationTreeMatcher {
