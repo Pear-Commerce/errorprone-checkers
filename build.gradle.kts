@@ -36,7 +36,7 @@ publishing {
       // JitPack will publish as com.github.<user>:errorprone-checkers:<tag>
       groupId = "com.pearcommerce"
       artifactId = "errorprone-checkers"
-      version = "0.0.0"
+      version = "0.0.9"
     }
   }
 }
