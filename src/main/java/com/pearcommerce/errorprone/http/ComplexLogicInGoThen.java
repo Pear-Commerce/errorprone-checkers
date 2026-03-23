@@ -9,8 +9,12 @@ import com.google.errorprone.VisitorState;
 import com.google.errorprone.bugpatterns.BugChecker;
 import com.google.errorprone.matchers.Description;
 import com.google.errorprone.matchers.Matcher;
+import com.google.errorprone.util.ASTHelpers;
 import com.sun.source.tree.*;
 import com.sun.source.util.TreeScanner;
+
+import javax.lang.model.element.Element;
+import javax.lang.model.type.TypeMirror;
 
 /**
  * Detects complex processing logic inside {@code JurlProxyFallback.goThen()} lambdas.
@@ -18,7 +22,7 @@ import com.sun.source.util.TreeScanner;
  * <p>Logic errors in goThen() trigger retries with all proxy types, wasting proxy credits.
  * Only JSON parsing and basic response validation belong in goThen().
  *
- * <p><b>Flags:</b> for-loops, stream.collect(), multiple statements, nested conditionals
+ * <p><b>Flags:</b> for-loops, stream.collect(), complex stream chains (>5 ops), many statements (>5), deep nesting (>2)
  *
  * <p><b>Example:</b>
  * <pre>{@code
@@ -31,7 +35,9 @@ import com.sun.source.util.TreeScanner;
  * });
  *
  * // GOOD: Only parsing in goThen
- * List<Store> stores = .goThen(jurl -> jurl.getResponseJsonList(Store.class)).get();
+ * List<Store> stores = new JurlProxyFallback(...)
+ *     .goThen(jurl -> jurl.getResponseJsonList(Store.class))
+ *     .get();
  * Map<String, Store> map = new HashMap<>();
  * for (Store s : stores) { map.put(s.id, s); }  // Processing outside - OK
  * }</pre>
@@ -64,7 +70,15 @@ public final class ComplexLogicInGoThen extends BugChecker
         }
 
         LambdaExpressionTree lambda = (LambdaExpressionTree) arg;
-        ComplexityScanner scanner = new ComplexityScanner();
+
+        // Count top-level statements only (don't sum nested blocks)
+        int topLevelStatements = 0;
+        Tree body = lambda.getBody();
+        if (body instanceof BlockTree) {
+            topLevelStatements = ((BlockTree) body).getStatements().size();
+        }
+
+        ComplexityScanner scanner = new ComplexityScanner(state, topLevelStatements);
         lambda.getBody().accept(scanner, null);
 
         if (scanner.hasComplexLogic()) {
@@ -91,14 +105,19 @@ public final class ComplexLogicInGoThen extends BugChecker
             msg.append("stream.collect()");
             first = false;
         }
-        if (scanner.statementCount > 3) {
+        if (scanner.streamOpCount > 5) {
             if (!first) msg.append(", ");
-            msg.append(scanner.statementCount).append(" statements (>3)");
+            msg.append(scanner.streamOpCount).append(" stream operations (>5)");
+            first = false;
+        }
+        if (scanner.statementCount > 5) {
+            if (!first) msg.append(", ");
+            msg.append(scanner.statementCount).append(" statements (>5)");
             first = false;
         }
         if (scanner.hasNestedConditional) {
             if (!first) msg.append(", ");
-            msg.append("nested conditionals");
+            msg.append("deeply nested conditionals (>2)");
         }
 
         return msg.toString();
@@ -106,14 +125,26 @@ public final class ComplexLogicInGoThen extends BugChecker
 
     /** Scans lambda body for patterns indicating business logic vs simple parsing. */
     private static class ComplexityScanner extends TreeScanner<Void, Void> {
+        private static final java.util.Set<String> STREAM_INTERMEDIATE_OPS = java.util.Set.of(
+            "map", "flatMap", "filter", "peek", "distinct", "sorted", "limit", "skip"
+        );
+
+        private final VisitorState state;
+        private final int statementCount;
+
         boolean hasForLoop = false;
         boolean hasStreamCollect = false;
         boolean hasNestedConditional = false;
-        int statementCount = 0;
         int conditionalDepth = 0;
+        int streamOpCount = 0;
+
+        ComplexityScanner(VisitorState state, int statementCount) {
+            this.state = state;
+            this.statementCount = statementCount;
+        }
 
         boolean hasComplexLogic() {
-            return hasForLoop || hasStreamCollect || statementCount > 3 || hasNestedConditional;
+            return hasForLoop || hasStreamCollect || statementCount > 5 || hasNestedConditional || streamOpCount > 5;
         }
 
         @Override
@@ -130,23 +161,35 @@ public final class ComplexLogicInGoThen extends BugChecker
 
         @Override
         public Void visitMethodInvocation(MethodInvocationTree node, Void unused) {
-            String methodString = node.getMethodSelect().toString();
-            if (methodString.endsWith(".collect") || methodString.contains(".collect(")) {
-                hasStreamCollect = true;
+            Element symbol = ASTHelpers.getSymbol(node);
+            if (symbol == null) {
+                return super.visitMethodInvocation(node, unused);
+            }
+
+            String methodName = symbol.getSimpleName().toString();
+            ExpressionTree receiver = ASTHelpers.getReceiver(node);
+
+            if (receiver != null) {
+                TypeMirror receiverType = ASTHelpers.getType(receiver);
+                if (receiverType != null) {
+                    String typeName = receiverType.toString();
+                    // Match java.util.stream.Stream and its specializations (IntStream, LongStream, etc.)
+                    if (typeName.startsWith("java.util.stream.")) {
+                        if ("collect".equals(methodName)) {
+                            hasStreamCollect = true;
+                        } else if (STREAM_INTERMEDIATE_OPS.contains(methodName)) {
+                            streamOpCount++;
+                        }
+                    }
+                }
             }
             return super.visitMethodInvocation(node, unused);
         }
 
         @Override
-        public Void visitBlock(BlockTree node, Void unused) {
-            statementCount += node.getStatements().size();
-            return super.visitBlock(node, unused);
-        }
-
-        @Override
         public Void visitIf(IfTree node, Void unused) {
             conditionalDepth++;
-            if (conditionalDepth > 1) {
+            if (conditionalDepth > 2) {
                 hasNestedConditional = true;
             }
             Void result = super.visitIf(node, unused);
