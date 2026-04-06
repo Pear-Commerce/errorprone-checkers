@@ -34,7 +34,7 @@ publishing {
     create<MavenPublication>("mavenJava") {
       from(components["java"])
       // JitPack will publish as com.github.<user>:errorprone-checkers:<tag>
-      groupId = "com.github.Pear-Commerce"
+      groupId = "com.pearcommerce"
       artifactId = "errorprone-checkers"
       version = "0.0.10"
     }
