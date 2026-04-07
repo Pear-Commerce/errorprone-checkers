@@ -43,6 +43,13 @@ import javax.lang.model.element.Element;
  *     .extraCacheKey(storeId)                           // ← Required
  *     .goThen(...);
  * }</pre>
+ *
+ * <p><b>When to suppress:</b> Not all cookies scope the response. Authentication tokens, CSRF
+ * cookies, and analytics/tracking cookies do not affect the returned data — all callers receive
+ * the same response regardless of their cookie value. In those cases, sharing a single cache entry
+ * is correct and {@code extraCacheKey} is not needed. Suppress this warning with
+ * {@code @SuppressWarnings("JurlCacheWithCookieMissingExtraCacheKey")} and a comment explaining
+ * why the cookie does not scope the response.
  */
 @AutoService(BugChecker.class)
 @BugPattern(
