@@ -11,10 +11,12 @@ import com.google.errorprone.matchers.Description;
 import com.google.errorprone.matchers.Matcher;
 import com.google.errorprone.util.ASTHelpers;
 import com.sun.source.tree.*;
+import com.sun.source.util.TreePath;
 import com.sun.source.util.TreeScanner;
 
-import javax.lang.model.type.TypeMirror;
+import com.sun.tools.javac.code.Type;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.lang.model.element.Element;
 
 /**
  * Flags {@code JurlProxyFallback} chains that call {@code .useJurlCache(true, ...)} without
@@ -54,6 +56,8 @@ public final class JurlCacheWithCookieMissingExtraCacheKey extends BugChecker
     private static final Matcher<ExpressionTree> USE_JURL_CACHE =
         instanceMethod().onExactClass("com.pear.http.JurlProxyFallback").named("useJurlCache");
 
+    private static final String JURL_PROXY_FALLBACK_CLASS = "com.pear.http.JurlProxyFallback";
+
     @Override
     public Description matchMethodInvocation(MethodInvocationTree tree, VisitorState state) {
         if (!USE_JURL_CACHE.matches(tree, state)) {
@@ -61,20 +65,14 @@ public final class JurlCacheWithCookieMissingExtraCacheKey extends BugChecker
         }
 
         // Only care about useJurlCache(true, ...) — caching disabled is fine
-        if (!isCachingEnabled(tree)) {
+        if (!isCachingEnabled(tree, state)) {
             return Description.NO_MATCH;
         }
 
-        // Walk the JurlProxyFallback chain to find extraCacheKey and the constructor
-        boolean hasExtraCacheKey = false;
+        // Walk DOWN the receiver chain (calls before useJurlCache) to find the constructor
         NewClassTree constructor = null;
-
         ExpressionTree node = tree;
         while (node instanceof MethodInvocationTree mit) {
-            String name = getMethodName(mit);
-            if ("extraCacheKey".equals(name)) {
-                hasExtraCacheKey = true;
-            }
             ExpressionTree receiver = getReceiver(mit);
             if (receiver instanceof NewClassTree nct) {
                 constructor = nct;
@@ -83,42 +81,103 @@ public final class JurlCacheWithCookieMissingExtraCacheKey extends BugChecker
             node = receiver;
         }
 
-        if (hasExtraCacheKey || constructor == null) {
+        if (constructor == null) {
             return Description.NO_MATCH;
         }
 
-        // Check whether any argument to the constructor contains a .cookie() call on a LoggedJurl
-        if (!constructorHasCookieInSupplier(constructor, state)) {
+        // Walk UP the call chain (calls after useJurlCache) via TreePath to find extraCacheKey
+        if (hasExtraCacheKeyAbove(state)) {
+            return Description.NO_MATCH;
+        }
+
+        // Check whether the supplier lambda argument to the constructor calls .cookie() on a LoggedJurl
+        if (!supplierHasCookie(constructor, state)) {
             return Description.NO_MATCH;
         }
 
         return describeMatch(tree);
     }
 
-    private boolean constructorHasCookieInSupplier(NewClassTree constructor, VisitorState state) {
+    /**
+     * Walks up the TreePath to check if any enclosing method invocation in the same chain
+     * calls extraCacheKey on JurlProxyFallback.
+     *
+     * <p>In a fluent chain {@code useJurlCache(...).extraCacheKey(...)}, the AST parent of the
+     * {@code useJurlCache} MethodInvocationTree is the MemberSelectTree for {@code .extraCacheKey},
+     * not the outer MethodInvocationTree. We must handle both node types when walking up.
+     */
+    private boolean hasExtraCacheKeyAbove(VisitorState state) {
+        TreePath path = state.getPath().getParentPath();
+        while (path != null) {
+            Tree leaf = path.getLeaf();
+            if (leaf instanceof MemberSelectTree mst) {
+                // This is the ".methodName" selector — check if it's extraCacheKey
+                if ("extraCacheKey".equals(mst.getIdentifier().toString())) {
+                    return true;
+                }
+                path = path.getParentPath();
+            } else if (leaf instanceof MethodInvocationTree mit) {
+                // Stop if we've left the JurlProxyFallback chain
+                Type jurlType = state.getTypeFromString(JURL_PROXY_FALLBACK_CLASS);
+                Type mitType = ASTHelpers.getType(mit);
+                if (mitType == null || jurlType == null ||
+                    !ASTHelpers.isSameType(mitType, jurlType, state)) {
+                    break;
+                }
+                path = path.getParentPath();
+            } else {
+                break;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Scans only the supplier lambda argument (the last functional-interface argument) of the
+     * JurlProxyFallback constructor for .cookie() calls on a LoggedJurl receiver.
+     */
+    private boolean supplierHasCookie(NewClassTree constructor, VisitorState state) {
+        Type loggedJurlType = state.getTypeFromString("com.pear.http.LoggedJurl");
+        if (loggedJurlType == null) {
+            return false;
+        }
+
+        // Find the supplier lambda — the last argument that is a lambda or method reference
+        LambdaExpressionTree supplierLambda = null;
+        for (ExpressionTree arg : constructor.getArguments()) {
+            if (arg instanceof LambdaExpressionTree lambda) {
+                supplierLambda = lambda;
+            }
+        }
+
+        if (supplierLambda == null) {
+            return false;
+        }
+
         AtomicBoolean found = new AtomicBoolean(false);
+        final LambdaExpressionTree lambdaToScan = supplierLambda;
         new TreeScanner<Void, Void>() {
             @Override
             public Void visitMethodInvocation(MethodInvocationTree node, Void unused) {
                 if (!found.get() && "cookie".equals(getMethodName(node))) {
-                    // Verify the receiver is a LoggedJurl (or its chain)
                     ExpressionTree receiver = getReceiver(node);
-                    if (receiver != null && isLoggedJurlChain(receiver, state)) {
+                    if (receiver != null && isLoggedJurlChain(receiver, loggedJurlType, state)) {
                         found.set(true);
                     }
                 }
                 return super.visitMethodInvocation(node, unused);
             }
-        }.scan(constructor, null);
+        }.scan(lambdaToScan, null);
         return found.get();
     }
 
-    private boolean isLoggedJurlChain(ExpressionTree expr, VisitorState state) {
-        // Walk down the chain to find a LoggedJurl type
+    private boolean isLoggedJurlChain(ExpressionTree expr, Type loggedJurlType, VisitorState state) {
         ExpressionTree current = expr;
         while (current != null) {
-            TypeMirror type = ASTHelpers.getType(current);
-            if (type != null && type.toString().contains("LoggedJurl")) {
+            Type type = ASTHelpers.getType(current);
+            if (type != null &&
+                (ASTHelpers.isSameType(type, loggedJurlType, state) ||
+                 ASTHelpers.isSubtype(type, loggedJurlType, state))) {
                 return true;
             }
             if (current instanceof MethodInvocationTree mit) {
@@ -130,24 +189,42 @@ public final class JurlCacheWithCookieMissingExtraCacheKey extends BugChecker
         return false;
     }
 
-    private boolean isCachingEnabled(MethodInvocationTree tree) {
+    private boolean isCachingEnabled(MethodInvocationTree tree, VisitorState state) {
         if (tree.getArguments().isEmpty()) return false;
-        return tree.getArguments().get(0).toString().equals("true");
+        Object constantValue = ASTHelpers.constValue(tree.getArguments().get(0));
+        return Boolean.TRUE.equals(constantValue);
     }
 
-    private String getMethodName(MethodInvocationTree tree) {
-        ExpressionTree select = tree.getMethodSelect();
-        if (select instanceof MemberSelectTree mst) {
+    private static String getMethodName(MethodInvocationTree tree) {
+        Element sym = ASTHelpers.getSymbol(tree);
+        if (sym != null) return sym.getSimpleName().toString();
+        if (tree.getMethodSelect() instanceof MemberSelectTree mst) {
             return mst.getIdentifier().toString();
         }
-        return select.toString();
+        String s = tree.getMethodSelect().toString();
+        int dot = s.lastIndexOf('.');
+        return dot >= 0 ? s.substring(dot + 1) : s;
     }
 
-    private ExpressionTree getReceiver(MethodInvocationTree tree) {
-        ExpressionTree select = tree.getMethodSelect();
-        if (select instanceof MemberSelectTree mst) {
-            return mst.getExpression();
-        }
-        return null;
+    private static ExpressionTree getReceiver(MethodInvocationTree tree) {
+        return unwrap(ASTHelpers.getReceiver(tree));
+    }
+
+    /** Strip parens/casts that can appear in chains so we don't miss constructors or receivers. */
+    private static ExpressionTree unwrap(ExpressionTree e) {
+        if (e == null) return null;
+        ExpressionTree cur = e;
+        boolean changed;
+        do {
+            changed = false;
+            if (cur instanceof ParenthesizedTree p) {
+                cur = p.getExpression();
+                changed = true;
+            } else if (cur instanceof TypeCastTree t) {
+                cur = t.getExpression();
+                changed = true;
+            }
+        } while (changed);
+        return cur;
     }
 }
