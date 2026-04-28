@@ -16,8 +16,8 @@ import com.sun.source.util.TreeScanner;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 /**
  * Detects application-service calls inside {@code JurlProxyFallback.goThen()} for-loops.
@@ -105,7 +105,7 @@ public final class ComplexLogicInGoThen extends BugChecker
             return Description.NO_MATCH;
         }
 
-        AppServiceCallInLoopScanner scanner = new AppServiceCallInLoopScanner(state);
+        AppServiceCallInLoopScanner scanner = new AppServiceCallInLoopScanner();
         lambda.getBody().accept(scanner, null);
 
         if (!scanner.violations.isEmpty()) {
@@ -129,13 +129,8 @@ public final class ComplexLogicInGoThen extends BugChecker
      */
     private static class AppServiceCallInLoopScanner extends TreeScanner<Void, Void> {
 
-        private final VisitorState state;
         private boolean insideLoop = false;
-        final List<String> violations = new ArrayList<>();
-
-        AppServiceCallInLoopScanner(VisitorState state) {
-            this.state = state;
-        }
+        final Set<String> violations = new LinkedHashSet<>();
 
         @Override
         public Void visitLambdaExpression(LambdaExpressionTree node, Void unused) {
@@ -164,15 +159,13 @@ public final class ComplexLogicInGoThen extends BugChecker
         public Void visitMethodInvocation(MethodInvocationTree node, Void unused) {
             if (insideLoop) {
                 Element sym = ASTHelpers.getSymbol(node);
-                if (sym instanceof ExecutableElement exec) {
-                    TypeElement enclosing = (TypeElement) exec.getEnclosingElement();
+                if (sym instanceof ExecutableElement exec
+                        && exec.getEnclosingElement() instanceof TypeElement enclosing) {
                     String className = enclosing.getQualifiedName().toString();
                     if (isApplicationServiceClass(className)) {
                         String methodName = exec.getSimpleName().toString();
                         String violation = className.substring(className.lastIndexOf('.') + 1) + "." + methodName + "()";
-                        if (!violations.contains(violation)) {
-                            violations.add(violation);
-                        }
+                        violations.add(violation);
                     }
                 }
             }

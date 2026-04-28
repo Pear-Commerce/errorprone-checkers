@@ -52,12 +52,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * });
  *
  * // BAD: null deserialization result returns empty object — no retry
+ * // (flagged only when getResponseJsonObject() is called directly in the if condition)
  * .goThen(lj -> {
- *     KrogerResponse resp = lj.getResponseJsonObject(KrogerResponse.class);
- *     if (resp == null || resp.data == null) {
+ *     if (lj.getResponseJsonObject(KrogerResponse.class) == null) {
  *         return new KrogerResponse();          // ← flagged
  *     }
- *     return resp.data;
+ *     return lj.getResponseJsonObject(KrogerResponse.class).data;
  * });
  *
  * // GOOD: throw explicitly so JurlProxyFallback retries with the next proxy
@@ -127,15 +127,15 @@ public final class GoThenValidationWithoutThrow extends BugChecker
     private static String buildMessage(TriggerKind kind) {
         String specific = switch (kind) {
             case STATUS_CODE ->
-                "lj.getResponseCode() is compared but the failure branch returns instead of " +
+                "getResponseCode() is called in the condition but the branch returns instead of " +
                 "throwing — the bad status is silenced and no proxy retry occurs";
             case NULL_DESERIALIZE ->
-                "the result of getResponseJsonObject/List/Map is null-checked but the null " +
+                "getResponseJsonObject/List/Map() is null-checked in the condition but the null " +
                 "branch returns instead of throwing — deserialization failure is silenced";
             default -> "response validation branch returns instead of throwing";
         };
         return "goThen() " + specific + ". " +
-               "Use 'throw new JurlException(jurl, \"<reason>\")' so JurlProxyFallback " +
+               "Use 'throw new JurlException(<jurl-param>, \"<reason>\")' so JurlProxyFallback " +
                "retries with the next proxy type (STATIC → ISP → RESIDENTIAL → ZENROWS → SCRAPFLY).";
     }
 
@@ -189,8 +189,9 @@ public final class GoThenValidationWithoutThrow extends BugChecker
 
                 @Override
                 public Void visitBinary(BinaryTree node, Void unused) {
-                    // Null checks: `expr == null` or `null == expr`
-                    if (node.getKind() == Tree.Kind.EQUAL_TO || node.getKind() == Tree.Kind.NOT_EQUAL_TO) {
+                    // Only `expr == null` or `null == expr` — the failure path.
+                    // `!= null` guards the success path; the else-branch may throw correctly.
+                    if (node.getKind() == Tree.Kind.EQUAL_TO) {
                         ExpressionTree left = node.getLeftOperand();
                         ExpressionTree right = node.getRightOperand();
                         if (isNullLiteral(left) && callsDeserializeMethod(right)) {
