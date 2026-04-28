@@ -157,7 +157,7 @@ public final class GoThenValidationWithoutThrow extends BugChecker
         @Override
         public Void visitIf(IfTree node, Void unused) {
             if (triggerKind != TriggerKind.NONE) {
-                return null; // already found one, stop scanning
+                return null;
             }
 
             TriggerKind kind = classifyCondition(node.getCondition());
@@ -174,32 +174,42 @@ public final class GoThenValidationWithoutThrow extends BugChecker
          * it null-checks the result of a deserialization method, NONE otherwise.
          */
         private TriggerKind classifyCondition(ExpressionTree condition) {
-            AtomicBoolean hasStatusCode = new AtomicBoolean(false);
+            AtomicBoolean hasStatusCodeFailureCheck = new AtomicBoolean(false);
             AtomicBoolean hasDeserializeNullCheck = new AtomicBoolean(false);
 
             new TreeScanner<Void, Void>() {
                 @Override
-                public Void visitMethodInvocation(MethodInvocationTree node, Void unused) {
-                    String name = methodName(node);
-                    if ("getResponseCode".equals(name)) {
-                        hasStatusCode.set(true);
-                    }
-                    return super.visitMethodInvocation(node, unused);
-                }
-
-                @Override
                 public Void visitBinary(BinaryTree node, Void unused) {
-                    // Only `expr == null` or `null == expr` — the failure path.
+                    ExpressionTree left = node.getLeftOperand();
+                    ExpressionTree right = node.getRightOperand();
+                    Tree.Kind op = node.getKind();
+
+                    // STATUS_CODE: getResponseCode() compared against a numeric literal,
+                    // where the comparison is true for error/failure codes (not the success path).
+                    // e.g. code >= 400, code > 299, code != 200, code == 404 — all failure checks.
+                    // e.g. code == 200, code < 400, code <= 299 — success checks, not flagged.
+                    if (callsGetResponseCode(left)) {
+                        Integer constant = intConstant(right);
+                        if (constant != null && isFailureComparison(op, constant)) {
+                            hasStatusCodeFailureCheck.set(true);
+                        }
+                    } else if (callsGetResponseCode(right)) {
+                        Integer constant = intConstant(left);
+                        if (constant != null && isFailureComparison(flip(op), constant)) {
+                            hasStatusCodeFailureCheck.set(true);
+                        }
+                    }
+
+                    // NULL_DESERIALIZE: only `expr == null` or `null == expr` — the failure path.
                     // `!= null` guards the success path; the else-branch may throw correctly.
-                    if (node.getKind() == Tree.Kind.EQUAL_TO) {
-                        ExpressionTree left = node.getLeftOperand();
-                        ExpressionTree right = node.getRightOperand();
+                    if (op == Tree.Kind.EQUAL_TO) {
                         if (isNullLiteral(left) && callsDeserializeMethod(right)) {
                             hasDeserializeNullCheck.set(true);
                         } else if (isNullLiteral(right) && callsDeserializeMethod(left)) {
                             hasDeserializeNullCheck.set(true);
                         }
                     }
+
                     return super.visitBinary(node, unused);
                 }
 
@@ -208,9 +218,58 @@ public final class GoThenValidationWithoutThrow extends BugChecker
                 // cheaply trace assignments here — only flag the direct-call form to stay precise.
             }.scan(condition, null);
 
-            if (hasStatusCode.get()) return TriggerKind.STATUS_CODE;
+            if (hasStatusCodeFailureCheck.get()) return TriggerKind.STATUS_CODE;
             if (hasDeserializeNullCheck.get()) return TriggerKind.NULL_DESERIALIZE;
             return TriggerKind.NONE;
+        }
+
+        /**
+         * Returns true when the comparison operator applied to getResponseCode() vs {@code constant}
+         * selects the failure path — i.e., the condition is true for error/non-success codes.
+         *
+         * <p>Treats 200-299 as the success range. Any comparison that is true only for codes
+         * outside that range on the then-branch is a failure check.
+         */
+        private boolean isFailureComparison(Tree.Kind op, int constant) {
+            // 3xx redirects are excluded: when followRedirects(false) is set, a 3xx inside
+            // goThen() is legitimate data (e.g. reading the Location header). Only 4xx/5xx
+            // are unambiguously failure codes that should trigger a retry.
+            return switch (op) {
+                // code >= 400  →  true for 4xx/5xx  →  failure
+                case GREATER_THAN_EQUAL -> constant >= 400;
+                // code > 399   →  equivalent to >= 400
+                case GREATER_THAN -> constant >= 399;
+                // code != 200, code != 201  →  true for everything except that code  →  failure
+                // (only flag when the excluded value is in the 2xx range)
+                case NOT_EQUAL_TO -> constant >= 200 && constant <= 299;
+                // code == 400, code == 401, code == 404, code == 500  →  specific error  →  failure
+                case EQUAL_TO -> constant >= 400;
+                // success checks (== 200, < 400, <= 299, etc.) — not flagged
+                default -> false;
+            };
+        }
+
+        /** Flips a comparison operator for when the operands are reversed (constant op code). */
+        private Tree.Kind flip(Tree.Kind op) {
+            return switch (op) {
+                case GREATER_THAN -> Tree.Kind.LESS_THAN;
+                case GREATER_THAN_EQUAL -> Tree.Kind.LESS_THAN_EQUAL;
+                case LESS_THAN -> Tree.Kind.GREATER_THAN;
+                case LESS_THAN_EQUAL -> Tree.Kind.GREATER_THAN_EQUAL;
+                default -> op; // EQUAL_TO, NOT_EQUAL_TO are symmetric
+            };
+        }
+
+        private boolean callsGetResponseCode(ExpressionTree expr) {
+            return expr instanceof MethodInvocationTree mit
+                && "getResponseCode".equals(methodName(mit));
+        }
+
+        private Integer intConstant(ExpressionTree expr) {
+            if (expr instanceof LiteralTree lit && lit.getValue() instanceof Integer i) {
+                return i;
+            }
+            return null;
         }
 
         private boolean isNullLiteral(ExpressionTree expr) {
