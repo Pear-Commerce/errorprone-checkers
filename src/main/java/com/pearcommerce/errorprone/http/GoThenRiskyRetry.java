@@ -27,8 +27,8 @@ import java.util.Set;
  * ISP → RESIDENTIAL → ZENROWS → SCRAPFLY). A for-loop over parsed response data is
  * structurally fine — the real risk is calling application services (database lookups,
  * ORM queries, external HTTP calls) from inside that loop. Those calls can throw for
- * reasons completely unrelated to the HTTP response, exhausting all proxy types on a
- * logic bug instead of a network error.
+ * reasons completely unrelated to the HTTP response. That can make extra proxy/vendor requests,
+ * skip what was actually a good scrape, and cost more money.
  *
  * <p>Plain iteration over a parsed response collection — field access, string manipulation,
  * JSoup DOM operations, JSON parsing — is safe and not flagged.
@@ -40,7 +40,7 @@ import java.util.Set;
  *
  * <p><b>Example:</b>
  * <pre>{@code
- * // BAD: UPC.fetchFuzzy() is a DB call — throws inside goThen retries all proxies
+ * // BAD: UPC.fetchFuzzy() is a DB call — throws inside goThen make scrape retries
  * .goThen(lj -> {
  *     MikMakConfig config = JSON.parseObject(lj.getResponseBody(), MikMakConfig.class);
  *     for (MikMakProduct product : config.products) {
@@ -62,12 +62,12 @@ import java.util.Set;
  */
 @AutoService(BugChecker.class)
 @BugPattern(
-    name = "ComplexLogicInGoThen",
-    summary = "Application-service call inside a goThen() for-loop — if it throws, " +
-              "JurlProxyFallback retries across all proxy types for a non-network error",
+    name = "GoThenRiskyRetry",
+    summary = "Application-service call inside goThen() can throw after a good scrape, causing " +
+              "extra retries and proxy/vendor cost",
     severity = SeverityLevel.WARNING
 )
-public final class ComplexLogicInGoThen extends BugChecker
+public final class GoThenRiskyRetry extends BugChecker
     implements BugChecker.MethodInvocationTreeMatcher {
 
     private static final Matcher<ExpressionTree> GO_THEN =
@@ -113,9 +113,10 @@ public final class ComplexLogicInGoThen extends BugChecker
             return buildDescription(tree)
                 .setMessage(
                     "goThen() for-loop calls application service(s): " + calls + ". " +
-                    "If any of these throw, JurlProxyFallback retries across all proxy types " +
-                    "(STATIC → ISP → RESIDENTIAL → ZENROWS → SCRAPFLY) for a non-network error. " +
-                    "Move the loop outside goThen() — parse the response inside, process outside."
+                    "If any of these throw accidentally, JurlProxyFallback treats it as a " +
+                    "scrape/proxy failure, can make more requests, potentially skip what was a " +
+                    "good scrape, and cost more money. Move the loop outside goThen() — parse " +
+                    "the response inside, process outside."
                 )
                 .build();
         }
