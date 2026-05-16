@@ -15,35 +15,38 @@ import com.sun.source.util.TreeScanner;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Flags {@code JurlProxyFallback.goThen()} lambdas that check the HTTP response status or
- * test a deserialized object for null, but return a value instead of throwing on failure.
+ * Flags cached {@code JurlProxyFallback.goThen()} lambdas that check a retryable/broad HTTP
+ * response status or test a deserialized object for null, but return a cacheable value instead
+ * of throwing on failure.
  *
  * <p>{@code goThen()} is the retry boundary: any exception thrown inside it causes
  * {@code JurlProxyFallback} to retry with the next proxy type (STATIC → ISP → RESIDENTIAL
- * → ZENROWS → SCRAPFLY). Returning a value — including an empty collection or a default
- * object — silently treats a bad response as success. The proxy cycle is never retried,
- * and the incomplete or malformed data propagates silently to callers.
+ * → ZENROWS → SCRAPFLY). When {@code useJurlCache(true, ...)} is enabled, returning a value —
+ * including an empty collection or a default object — silently treats a bad response as success
+ * and can cache an incomplete or malformed value for future callers, causing wrong behavior
+ * that is difficult to debug and fix.
  *
- * <p>This is the complement of {@link ComplexLogicInGoThen}: that checker catches lambdas
+ * <p>This is the complement of {@link GoThenRiskyRetry}: that checker catches lambdas
  * that accidentally <em>throw</em> on logic errors; this one catches lambdas that
  * accidentally <em>swallow</em> HTTP failures by returning instead of throwing.
  *
  * <p><b>Triggers on exactly two patterns:</b>
  * <ol>
- *   <li>An {@code if} whose condition calls {@code getResponseCode()} and whose then-branch
- *       returns without throwing — the caller never sees the bad status.
+ *   <li>An {@code if} whose condition calls {@code getResponseCode()} for a broad non-success or
+ *       5xx path and whose then-branch returns without throwing — the cache stores the bad result.
  *   <li>An {@code if} that null-checks the result of {@code getResponseJsonObject()},
  *       {@code getResponseJsonList()}, or {@code getResponseJsonMap()} and whose then-branch
- *       returns without throwing — deserialization failure is silenced.
+ *       returns without throwing — the cache stores the bad result.
  * </ol>
  *
  * <p>Format-detection checks ({@code responseBodyContains}, HTML scraping, field presence
- * tests unrelated to the HTTP status) are intentionally <em>not</em> flagged — those are
- * business logic, not HTTP validation.
+ * tests unrelated to the HTTP status), plus exact/bounded 4xx no-data checks, are intentionally
+ * <em>not</em> flagged — those are business logic, not HTTP validation.
  *
  * <p><b>Example:</b>
  * <pre>{@code
- * // BAD: 4xx returns empty list — no retry, caller sees empty success
+ * // BAD: broad error path returns empty list — no retry for 5xx, cache sees empty success
+ * .useJurlCache(true, TimeUnit.DAYS.toMillis(1))
  * .goThen(lj -> {
  *     if (lj.getResponseCode() >= 400) {
  *         return new ArrayList<>();              // ← flagged
@@ -53,6 +56,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * // BAD: null deserialization result returns empty object — no retry
  * // (flagged only when getResponseJsonObject() is called directly in the if condition)
+ * .useJurlCache(true, TimeUnit.DAYS.toMillis(1))
  * .goThen(lj -> {
  *     if (lj.getResponseJsonObject(KrogerResponse.class) == null) {
  *         return new KrogerResponse();          // ← flagged
@@ -71,12 +75,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 @AutoService(BugChecker.class)
 @BugPattern(
-    name = "GoThenValidationWithoutThrow",
-    summary = "goThen() checks HTTP status or null-tests a deserialized object but returns " +
-              "instead of throwing — the failure is silenced and JurlProxyFallback never retries",
+    name = "GoThenRiskyCaching",
+    summary = "cached goThen() returns instead of throwing on a failed request; the wrong value " +
+              "can be cached and cause hard-to-debug behavior",
     severity = SeverityLevel.WARNING
 )
-public final class GoThenValidationWithoutThrow extends BugChecker
+public final class GoThenRiskyCaching extends BugChecker
     implements BugChecker.MethodInvocationTreeMatcher {
 
     private static final Matcher<ExpressionTree> GO_THEN =
@@ -95,6 +99,9 @@ public final class GoThenValidationWithoutThrow extends BugChecker
     @Override
     public Description matchMethodInvocation(MethodInvocationTree tree, VisitorState state) {
         if (!GO_THEN.matches(tree, state)) {
+            return Description.NO_MATCH;
+        }
+        if (!hasEnabledJurlCacheInChain(tree)) {
             return Description.NO_MATCH;
         }
 
@@ -124,19 +131,65 @@ public final class GoThenValidationWithoutThrow extends BugChecker
         return Description.NO_MATCH;
     }
 
+    private static boolean hasEnabledJurlCacheInChain(MethodInvocationTree tree) {
+        ExpressionTree receiver = receiver(tree);
+        while (receiver != null) {
+            receiver = stripParens(receiver);
+            if (receiver instanceof MethodInvocationTree invocation) {
+                if ("useJurlCache".equals(methodName(invocation)) && cacheCanBeEnabled(invocation)) {
+                    return true;
+                }
+                receiver = receiver(invocation);
+            } else if (receiver instanceof MemberSelectTree select) {
+                receiver = select.getExpression();
+            } else {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static boolean cacheCanBeEnabled(MethodInvocationTree invocation) {
+        if (invocation.getArguments().isEmpty()) {
+            return false;
+        }
+        ExpressionTree first = stripParens(invocation.getArguments().getFirst());
+        return !(first instanceof LiteralTree lit && Boolean.FALSE.equals(lit.getValue()));
+    }
+
+    private static ExpressionTree receiver(MethodInvocationTree tree) {
+        ExpressionTree select = tree.getMethodSelect();
+        return select instanceof MemberSelectTree memberSelect ? memberSelect.getExpression() : null;
+    }
+
+    private static ExpressionTree stripParens(ExpressionTree expr) {
+        while (expr instanceof ParenthesizedTree paren) {
+            expr = paren.getExpression();
+        }
+        return expr;
+    }
+
+    private static String methodName(MethodInvocationTree tree) {
+        ExpressionTree sel = tree.getMethodSelect();
+        if (sel instanceof MemberSelectTree mst) return mst.getIdentifier().toString();
+        return sel.toString();
+    }
+
     private static String buildMessage(TriggerKind kind) {
         String specific = switch (kind) {
             case STATUS_CODE ->
-                "getResponseCode() is called in the condition but the branch returns instead of " +
-                "throwing — the bad status is silenced and no proxy retry occurs";
+                "getResponseCode() is called in a broad or 5xx condition but the branch returns " +
+                "instead of throwing";
             case NULL_DESERIALIZE ->
                 "getResponseJsonObject/List/Map() is null-checked in the condition but the null " +
-                "branch returns instead of throwing — deserialization failure is silenced";
+                "branch returns instead of throwing";
             default -> "response validation branch returns instead of throwing";
         };
         return "goThen() " + specific + ". " +
-               "Use 'throw new JurlException(<jurl-param>, \"<reason>\")' so JurlProxyFallback " +
-               "retries with the next proxy type (STATIC → ISP → RESIDENTIAL → ZENROWS → SCRAPFLY).";
+               "Returning instead of throwing on a failed cached request can store a value you " +
+               "do not want cached, causing wrong behavior that is difficult to debug and fix. " +
+               "Throw a JurlException so the attempt is treated as failed and the fallback value " +
+               "is not written to JurlCache.";
     }
 
     private enum TriggerKind { NONE, STATUS_CODE, NULL_DESERIALIZE }
@@ -176,6 +229,7 @@ public final class GoThenValidationWithoutThrow extends BugChecker
         private TriggerKind classifyCondition(ExpressionTree condition) {
             AtomicBoolean hasStatusCodeFailureCheck = new AtomicBoolean(false);
             AtomicBoolean hasDeserializeNullCheck = new AtomicBoolean(false);
+            boolean boundedFourHundredStatusCheck = isBoundedFourHundredStatusCheck(condition);
 
             new TreeScanner<Void, Void>() {
                 @Override
@@ -186,14 +240,14 @@ public final class GoThenValidationWithoutThrow extends BugChecker
 
                     // STATUS_CODE: getResponseCode() compared against a numeric literal,
                     // where the comparison is true for error/failure codes (not the success path).
-                    // e.g. code >= 400, code > 299, code != 200, code == 404 — all failure checks.
+                    // e.g. code >= 400, code > 299, code != 200 — all failure checks.
                     // e.g. code == 200, code < 400, code <= 299 — success checks, not flagged.
-                    if (callsGetResponseCode(left)) {
+                    if (!boundedFourHundredStatusCheck && callsGetResponseCode(left)) {
                         Integer constant = intConstant(right);
                         if (constant != null && isFailureComparison(op, constant)) {
                             hasStatusCodeFailureCheck.set(true);
                         }
-                    } else if (callsGetResponseCode(right)) {
+                    } else if (!boundedFourHundredStatusCheck && callsGetResponseCode(right)) {
                         Integer constant = intConstant(left);
                         if (constant != null && isFailureComparison(flip(op), constant)) {
                             hasStatusCodeFailureCheck.set(true);
@@ -232,8 +286,8 @@ public final class GoThenValidationWithoutThrow extends BugChecker
          */
         private boolean isFailureComparison(Tree.Kind op, int constant) {
             // 3xx redirects are excluded: when followRedirects(false) is set, a 3xx inside
-            // goThen() is legitimate data (e.g. reading the Location header). Only 4xx/5xx
-            // are unambiguously failure codes that should trigger a retry.
+            // goThen() is legitimate data (e.g. reading the Location header). Explicit 4xx
+            // no-data paths are cacheable; broad predicates that include 5xx still warn.
             return switch (op) {
                 // code >= 400  →  true for 4xx/5xx  →  failure
                 case GREATER_THAN_EQUAL -> constant >= 400;
@@ -242,11 +296,71 @@ public final class GoThenValidationWithoutThrow extends BugChecker
                 // code != 200, code != 201  →  true for everything except that code  →  failure
                 // (only flag when the excluded value is in the 2xx range)
                 case NOT_EQUAL_TO -> constant >= 200 && constant <= 299;
-                // code == 400, code == 401, code == 404, code == 500  →  specific error  →  failure
-                case EQUAL_TO -> constant >= 400;
+                // code == 400/404 is usually deterministic no-data; exact 5xx remains retryable.
+                case EQUAL_TO -> constant >= 500;
                 // success checks (== 200, < 400, <= 299, etc.) — not flagged
                 default -> false;
             };
+        }
+
+        private boolean isBoundedFourHundredStatusCheck(ExpressionTree condition) {
+            StatusBounds bounds = new StatusBounds();
+            collectStatusBounds(condition, bounds);
+            return bounds.lower != null && bounds.lower >= 400
+                && bounds.upper != null && bounds.upper <= 499;
+        }
+
+        private void collectStatusBounds(ExpressionTree expr, StatusBounds bounds) {
+            expr = stripParentheses(expr);
+            if (!(expr instanceof BinaryTree node)) {
+                return;
+            }
+            if (node.getKind() == Tree.Kind.CONDITIONAL_AND) {
+                collectStatusBounds(node.getLeftOperand(), bounds);
+                collectStatusBounds(node.getRightOperand(), bounds);
+                return;
+            }
+
+            ExpressionTree left = node.getLeftOperand();
+            ExpressionTree right = node.getRightOperand();
+            Tree.Kind op = node.getKind();
+            Integer constant = null;
+            if (callsGetResponseCode(left)) {
+                constant = intConstant(right);
+            } else if (callsGetResponseCode(right)) {
+                constant = intConstant(left);
+                op = flip(op);
+            }
+            if (constant == null) {
+                return;
+            }
+            switch (op) {
+                case GREATER_THAN_EQUAL -> bounds.lower = max(bounds.lower, constant);
+                case GREATER_THAN -> bounds.lower = max(bounds.lower, constant + 1);
+                case LESS_THAN_EQUAL -> bounds.upper = min(bounds.upper, constant);
+                case LESS_THAN -> bounds.upper = min(bounds.upper, constant - 1);
+                default -> {}
+            }
+        }
+
+        private ExpressionTree stripParentheses(ExpressionTree expr) {
+            while (expr instanceof ParenthesizedTree paren) {
+                expr = paren.getExpression();
+            }
+            return expr;
+        }
+
+        private Integer max(Integer current, int next) {
+            return current == null ? next : Math.max(current, next);
+        }
+
+        private Integer min(Integer current, int next) {
+            return current == null ? next : Math.min(current, next);
+        }
+
+        private static class StatusBounds {
+            Integer lower;
+            Integer upper;
         }
 
         /** Flips a comparison operator for when the operands are reversed (constant op code). */
@@ -335,10 +449,5 @@ public final class GoThenValidationWithoutThrow extends BugChecker
             return found.get();
         }
 
-        private static String methodName(MethodInvocationTree tree) {
-            ExpressionTree sel = tree.getMethodSelect();
-            if (sel instanceof MemberSelectTree mst) return mst.getIdentifier().toString();
-            return sel.toString();
-        }
     }
 }
